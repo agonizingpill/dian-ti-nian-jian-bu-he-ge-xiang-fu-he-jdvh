@@ -12,11 +12,14 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .casework_routes import router as operational_cases
 from .operations_evidence import router as operations_evidence
+from .triage_routes import router as triage_router
+from . import triage_store
 from .auth import create_token, current_user, hash_password, require_roles
 from .db import connection, init_schema
 from .middlewares.request_context import AuditRequestMiddleware
 from .schemas.domain import LoginIn, LiftIn, ItemIn, NoticeIn, RecheckIn, RecheckReviewIn
 from .services.queries import fetch_items, fetch_lift
+from .triage import FALLBACK_VERSION, SpecLoadError, TriageSpec, registry
 from .utils.audit import log_action
 
 redis_client = redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"), decode_responses=True)
@@ -24,11 +27,17 @@ redis_client = redis.from_url(os.getenv("REDIS_URL", "redis://redis:6379/0"), de
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_schema()
+    # Register built-in triage trees and recover jobs interrupted by a worker
+    # crash before the API starts accepting orders.
+    triage_store.seed_builtin_versions()
+    for job_id in triage_store.reset_interrupted_jobs():
+        redis_client.lpush("lift_analysis", str(job_id))
     yield
 
 app = FastAPI(title="电梯年检不合格项复核", version="1.0.0", lifespan=lifespan)
 app.include_router(operational_cases)
 app.include_router(operations_evidence)
+app.include_router(triage_router)
 app.add_middleware(AuditRequestMiddleware)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -145,6 +154,13 @@ def get_lift(lift_id: int, user=Depends(current_user)):
     lift["notices"] = rows("""SELECT n.*,i.code item_code,i.title item_title FROM rectification_notices n
       JOIN inspection_items i ON i.id=n.inspection_item_id WHERE n.lift_id=%s ORDER BY n.id DESC""", (lift_id,))
     lift["analysis"] = row("SELECT * FROM analysis_jobs WHERE lift_id=%s ORDER BY id DESC LIMIT 1", (lift_id,))
+    if lift["analysis"] and lift["analysis"].get("path_rules_json"):
+        try:
+            lift["analysis"]["path_rules"] = json.loads(lift["analysis"]["path_rules_json"])
+            if not lift["analysis"].get("model_version"):
+                lift["analysis"]["model_version"] = FALLBACK_VERSION
+        except Exception:
+            pass
     lift["certificate"] = row("SELECT * FROM certificates WHERE lift_id=%s AND status='issued' ORDER BY id DESC LIMIT 1", (lift_id,))
     return lift
 
@@ -180,11 +196,30 @@ def enqueue_review(lift_id: int, user=Depends(require_roles("operator", "supervi
         "failed_item_count": sum(1 for x in items if x["result"] == "fail"),
         "documentation_gap": sum(1 for x in items if x["category"] == "documentation" and x["result"] == "fail"),
     }
-    job_id = execute("INSERT INTO analysis_jobs(lift_id,status,features_json) VALUES(%s,'queued',%s)", (lift_id, json.dumps(features)))
+    # The active pointer is read inside the INSERT so concurrent intake always
+    # pins the version effective at this exact instant.
+    job_id = triage_store.pin_job(lift_id, features)
+    pinned = row("SELECT model_version FROM analysis_jobs WHERE id=%s", (job_id,))
+    pinned_version = (pinned or {}).get("model_version") or FALLBACK_VERSION
+    # Defensive fallback: if the pinned tree cannot build, keep serving orders
+    # on the baseline version rather than blocking the workbench. A missing
+    # registry row or unreachable DB is not treated as a model failure.
+    used_version = pinned_version
+    try:
+        registry.get(triage_store.load_spec(pinned_version))
+    except SpecLoadError as exc:
+        used_version = FALLBACK_VERSION
+        registry.get(triage_store.load_spec(FALLBACK_VERSION))
+        execute("UPDATE analysis_jobs SET model_version=%s WHERE id=%s", (used_version, job_id))
+        log_action(int(user["sub"]), "triage_fallback", "analysis_job", job_id,
+                   {"requested_version": pinned_version, "fallback_version": used_version,
+                    "error": str(exc)})
     redis_client.lpush("lift_analysis", str(job_id))
     execute("UPDATE lifts SET status='under_review' WHERE id=%s", (lift_id,))
-    log_action(int(user["sub"]), "enqueue_review", "analysis_job", job_id, {"lift_id": lift_id, "features": features})
-    return {"job_id": job_id, "status": "queued", "features": features}
+    log_action(int(user["sub"]), "enqueue_review", "analysis_job", job_id,
+               {"lift_id": lift_id, "features": features, "model_version": used_version})
+    return {"job_id": job_id, "status": "queued", "features": features,
+            "model_version": used_version}
 
 
 @app.get("/api/lifts/{lift_id}/analysis")
@@ -193,7 +228,11 @@ def get_analysis(lift_id: int, user=Depends(current_user)):
     result = row("SELECT * FROM analysis_jobs WHERE lift_id=%s ORDER BY id DESC LIMIT 1", (lift_id,))
     if result and result.get("path_rules_json"):
         try:
-            result["path_rules"] = json.loads(result["path_rules_json"])
+            parsed = json.loads(result["path_rules_json"])
+            result["path_rules"] = parsed
+            # Backfill version for rows completed before versioning existed.
+            if not result.get("model_version"):
+                result["model_version"] = parsed.get("model_version") or FALLBACK_VERSION
         except Exception:
             result["path_rules"] = result["path_rules_json"]
     return result or {"status": "not_started"}
